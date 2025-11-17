@@ -1,0 +1,165 @@
+---
+- name: Setup classroom environment
+  hosts: localhost
+  gather_facts: true
+  force_handlers: true
+
+  tasks:
+    - name: Check if user is logged in via GUI
+      register: login_type
+      changed_when: false
+      ansible.builtin.shell: >
+        loginctl show-session $(loginctl --no-legend | awk '{print $1}') -p Type --value
+
+    - name: Ensure message about maximizing terminal window is displayed
+      ansible.builtin.debug:
+        msg: |
+
+          ⚠️ ️                 ⚠️                  ⚠️                  ⚠️                  ⚠️
+
+          Please ensure that your terminal window is maximized for the best experience.
+
+          Clue: Double click the title bar.
+
+          ⚠️ ️                 ⚠️                  ⚠️                  ⚠️                  ⚠️
+
+    - name: Ensure 5 second pause to read message
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Terminate playbook if user is not logged in via GUI
+      ansible.builtin.assert:
+        that:
+          - "'x11' in login_type['stdout'] or 'wayland' in login_type['stdout']"
+        fail_msg: |
+          ⛔️  ️    ⛔️      ⛔️      ⛔️      ⛔️      ⛔️      ⛔️      ⛔️
+
+          This playbook must be run from a console session at
+          https://rol.redhat.com
+
+          ⛔️  ️    ⛔️      ⛔️      ⛔️      ⛔️      ⛔️      ⛔️      ⛔️
+
+    - name: Ensure needed packages are installed
+      become: true
+      ansible.builtin.dnf:
+        name: "{{ rpm_packages }}"
+        state: installed
+        disable_gpg_check: true
+
+    - name: Ensure pip3 is installed with python 3.11
+      register: pip3_output
+      ansible.builtin.command: /usr/bin/python3 -m ensurepip
+      changed_when: >
+        'Requirement already satisfied' not in pip3_output['stdout']
+
+    - name: Ensure needed python packages are installed
+      ansible.builtin.pip:
+        name: "{{ python_packages }}"
+        state: present
+        extra_args: --user
+
+    - name: Ensure needed system directories are present
+      become: true
+      loop: "{{ system_dir_list }}"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+
+    - name: Ensure plugin repos are cloned
+      become: true
+      loop: "{{ vim_plugins_list }}"
+      ansible.builtin.git:
+        repo: "{{ item }}"
+        dest: /usr/share/vim/vimfiles/pack/vendor/start/{{ item.split('/')[-1] | regex_replace('\.git$') }}
+
+    - name: Render terminal profile template
+      ansible.builtin.template:
+        src: terminal_profile.j2
+        dest: /var/tmp/terminal_profile
+        mode: 0644
+
+    - name: Ensure config files are copied
+      loop: "{{ lookup('dict', config_files) }}"
+      notify: Reload terminal
+      ansible.builtin.copy:
+        src: "{{ item['value']['file'] }}"
+        dest: "{{ item['value']['dest'] }}"
+
+    - name: Ensure /etc/bashrc is configured
+      become: true
+      ansible.builtin.blockinfile:
+        path: /etc/bashrc
+        block: "{{ my_bashrc }}"
+        state: present
+
+    - name: Ensure ~/.ssh/config is configured
+      ansible.builtin.blockinfile:
+        path: ~/.ssh/config
+        block: "{{ my_sshconfig }}"
+        state: present
+        marker: "# {mark} classroom_env managed block"
+
+    - name: Create an Alt + Tab alternative with Alt + q
+      ansible.builtin.shell: >
+        gsettings set org.gnome.desktop.wm.keybindings switch-windows "['<Alt>q']"
+      changed_when: false
+      when: "'<Alt>q' not in lookup('pipe', 'gsettings get org.gnome.desktop.wm.keybindings switch-windows')"
+
+    - name: Create motd file with wiki URL
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/profile.d/classroom_env.sh
+        content: "{{ classroom_env_motd }}"
+        mode: "0755"
+
+    - name: Ensure RHEL9 tasks are included
+      when: ansible_facts['distribution_major_version'] == "9"
+      ansible.builtin.include_tasks:
+        file: tasks/rhel9_tasks.yml
+
+    - name: Ensure RHEL10 tasks are included
+      when: ansible_facts['distribution_major_version'] == "10"
+      ansible.builtin.include_tasks:
+        file: tasks/rhel10_tasks.yml
+
+    - name: Ensure git tasks are included
+      tags:
+        - rdc
+        - never
+      ansible.builtin.include_tasks:
+        file: tasks/rdc_git.yml
+        apply:
+          tags:
+            - rdc
+
+    - name: Ensure zerotier tasks are included
+      tags:
+        - zerotier
+        - never
+      loop:
+        - tasks/zerotier.yml
+        - tasks/firewall.yml
+      ansible.builtin.include_tasks:
+        file: "{{ item }}"
+        apply:
+          tags:
+            - zerotier
+
+  handlers:
+    # community.general.dconf was considered but did not behave as expected
+    - name: Ensure profile is loaded
+      when: ansible_facts['distribution_major_version'] == "9"
+      listen: Reload terminal
+      ansible.builtin.shell: dconf load /org/gnome/terminal/ < /var/tmp/terminal_profile
+      args:
+        creates: /var/tmp/terminal_profile_loaded
+
+    - name: Ensure terminal terminates RHEL9
+      when: ansible_facts['distribution_major_version'] == "9"
+      listen: Reload terminal
+      ansible.builtin.command: killall gnome-terminal-server
+
+    - name: Ensure network service is restarted
+      ansible.builtin.service:
+        name: network
+        state: restarted
